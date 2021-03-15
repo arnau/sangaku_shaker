@@ -1,11 +1,11 @@
 use anyhow::Result;
-use rusqlite::NO_PARAMS;
+use rusqlite::{Connection, NO_PARAMS};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::fs;
 use std::io;
 use std::io::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod storage;
 
@@ -30,11 +30,15 @@ struct Metadata {
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
     ordinal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     parent: Option<String>,
+    #[serde(skip)]
     ancestor: u32,
     slug: String,
     title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     difficulty: Option<u32>,
+    #[serde(skip)]
     content: String,
 }
 
@@ -69,8 +73,7 @@ fn process_entry(pond: storage::Pond, path: &PathBuf) -> Result<()> {
             .to_lowercase()
             .chars()
             .filter_map(|ch| match ch {
-                'a'...'z' => Some(ch),
-                '-' => Some(ch),
+                'a'..='z' | '-' => Some(ch),
                 ' ' => Some('-'),
                 _ => None,
             })
@@ -105,11 +108,7 @@ fn process_entry(pond: storage::Pond, path: &PathBuf) -> Result<()> {
         VALUES (?, ?, ?, ?, ?, ?, ?);
     "#,
             &values,
-        )
-        .unwrap_or_else(|err| {
-            dbg!(&ordinal);
-            0
-        });
+        )?;
     } else {
         println!("Skipping {}. No content in {}.", &ordinal, &lang);
     }
@@ -117,13 +116,123 @@ fn process_entry(pond: storage::Pond, path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn build_metadata(data: &mut String, record: &Record) -> Result<()> {
+    let blob = serde_yaml::to_string(record)?;
+    data.push_str(&blob);
+    data.push_str("---\n");
+
+    Ok(())
+}
+
+fn query_children(conn: &Connection, ordinal: &str) -> Result<Vec<Record>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            *
+        FROM
+            entry
+        WHERE
+            parent IS ?
+        ORDER BY
+            ordinal;
+    "#,
+    )?;
+
+    let mut list = Vec::new();
+    let rows = stmt.query_map(&[ordinal], |row| {
+        Ok(Record {
+            ordinal: row.get(0)?,
+            parent: row.get(1)?,
+            ancestor: row.get(2)?,
+            slug: row.get(3)?,
+            title: row.get(4)?,
+            difficulty: row.get(5)?,
+            content: row.get(6)?,
+        })
+    })?;
+
+    for result in rows {
+        list.push(result?);
+    }
+
+    Ok(list)
+}
+
+/// Builds either a node or a leaf.
+fn build_content(conn: &Connection, record: &Record) -> Result<(String, Vec<Record>)> {
+    let children = query_children(conn, &record.ordinal)?;
+
+    let data = if children.is_empty() {
+        build_leaf(&record)?
+    } else {
+        build_node(record, &children)?
+    };
+
+    Ok((data, children))
+}
+
+/// Builds a tree node.
+fn build_node(record: &Record, children: &[Record]) -> Result<String> {
+    let mut data = String::new();
+    build_metadata(&mut data, &record)?;
+
+    data.push_str(&format!("# {}\n\n", &record.title));
+    data.push_str(&record.content);
+    data.push_str("\n\n## Table of contents\n\n");
+
+    for child in children {
+        let item = format!("- [{}](./{}.md)\n", &child.title, &child.slug);
+        data.push_str(&item);
+    }
+
+    Ok(data)
+}
+
+/// Builds a leaf of content.
+fn build_leaf(record: &Record) -> Result<String> {
+    let mut data = String::new();
+    build_metadata(&mut data, &record)?;
+
+    data.push_str(&format!("# {}\n\n", &record.title));
+    data.push_str(&record.content);
+
+    Ok(data)
+}
+
+/// Takes a record, walks through the dependent tree and writes to a file.
+fn write_tree(conn: &Connection, record: &Record, path: &PathBuf) -> Result<()> {
+    let (data, children) = build_content(conn, &record)?;
+
+    fs::write(&path.join("index.md"), &data)?;
+
+    for child in children {
+        write_node(conn, &child, &path)?;
+    }
+
+    Ok(())
+}
+
+/// Takes a record, walks through the dependent tree and writes to a file.
+fn write_node(conn: &Connection, record: &Record, path: &PathBuf) -> Result<()> {
+    let (data, children) = build_content(conn, &record)?;
+    let filename = format!("{}.md", record.slug);
+
+    fs::write(&path.join(&filename), &data)?;
+
+    for child in children {
+        write_node(conn, &child, &path)?;
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let source = "../sangaku_manasource/src";
-    let target = "content";
+    let target = Path::new("content");
     let pond = storage::connect()?;
 
     // Create target dir
-    // fs::create_dir(target)?;
+    fs::create_dir(target)?;
 
     // Flesh out target structure
     let excluded_names = vec!["assets", "temario.md"];
@@ -142,8 +251,19 @@ fn main() -> Result<()> {
     }
 
     let conn = pond.get()?;
-    let mut stmt = conn.prepare("SELECT * FROM entry ORDER BY ordinal;")?;
-    // let mut list = Vec::new();
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            *
+        FROM
+            entry
+        WHERE
+            parent IS NULL
+        ORDER BY
+            ordinal;
+    "#,
+    )?;
+
     let rows = stmt.query_map(NO_PARAMS, |row| {
         Ok(Record {
             ordinal: row.get(0)?,
@@ -158,8 +278,11 @@ fn main() -> Result<()> {
 
     for result in rows {
         let entry = result?;
-        // list.push(result?);
-        dbg!(&entry);
+        let section = target.join(&entry.slug);
+
+        fs::create_dir(&section)?;
+
+        write_tree(&conn, &entry, &section)?;
     }
 
     Ok(())
