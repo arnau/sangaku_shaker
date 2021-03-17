@@ -8,7 +8,7 @@ use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 
 mod storage;
-use storage::{query_children, query_sections, Pond, Record};
+use storage::{query_children, query_sections, query_siblings, Pond, Record};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct MetaItem {
@@ -114,7 +114,9 @@ fn build_content(conn: &Connection, record: &Record) -> Result<(String, Vec<Reco
     let children = query_children(conn, &record.ordinal)?;
 
     let data = if children.is_empty() {
-        build_leaf(&record)?
+        let siblings = query_siblings(&conn, &record.ordinal)?;
+
+        build_leaf(&record, siblings)?
     } else {
         build_node(record, &children)?
     };
@@ -140,12 +142,24 @@ fn build_node(record: &Record, children: &[Record]) -> Result<String> {
 }
 
 /// Builds a leaf of content.
-fn build_leaf(record: &Record) -> Result<String> {
+fn build_leaf(record: &Record, siblings: (Option<Record>, Option<Record>)) -> Result<String> {
+    let (prev, next) = siblings;
+    let mut nav = Vec::new();
     let mut data = String::new();
     build_metadata(&mut data, &record)?;
 
+    if let Some(prev) = prev {
+        nav.push(format!("- Previous: [{}]({}.md)", &prev.title, &prev.slug));
+    }
+
+    if let Some(next) = next {
+        nav.push(format!("- Next: [{}]({}.md)", &next.title, &next.slug));
+    }
+
     data.push_str(&format!("# {}\n\n", &record.title));
     data.push_str(&record.content);
+    data.push_str("\n\n## Navigation\n\n");
+    data.push_str(&(nav.join("\n")));
 
     Ok(data)
 }

@@ -1,13 +1,10 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
-use rusqlite::{Connection, Transaction, NO_PARAMS};
+use rusqlite::{Connection, Error::QueryReturnedNoRows, NO_PARAMS};
 use serde::{Deserialize, Serialize};
 use std::include_str;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::thread;
 
 pub type Pond = Pool<SqliteConnectionManager>;
 
@@ -104,4 +101,55 @@ pub fn query_sections(conn: &Connection) -> Result<Vec<Record>> {
     }
 
     Ok(list)
+}
+
+/// Finds the sibling entries for the given ordinal.
+pub fn query_siblings(
+    conn: &Connection,
+    ordinal: &str,
+) -> Result<(Option<Record>, Option<Record>)> {
+    let trail: Vec<&str> = ordinal.split('.').collect();
+    let upbound = trail.len() - 1;
+    let current_index: u32 = trail[upbound].parse()?;
+    let prev_index = current_index - 1;
+    let next_index = current_index + 1;
+
+    let prev_ordinal = format!("{}.{}", trail[0..upbound].join("."), prev_index);
+    let next_ordinal = format!("{}.{}", trail[0..upbound].join("."), next_index);
+
+    let prev = query_record(conn, &prev_ordinal)?;
+    let next = query_record(conn, &next_ordinal)?;
+
+    Ok((prev, next))
+}
+
+pub fn query_record(conn: &Connection, ordinal: &str) -> Result<Option<Record>> {
+    let result = conn.query_row(
+        r#"
+        SELECT
+            *
+        FROM
+            entry
+        WHERE
+            ordinal = ?
+        "#,
+        &[ordinal],
+        |row| {
+            Ok(Record {
+                ordinal: row.get(0)?,
+                parent: row.get(1)?,
+                ancestor: row.get(2)?,
+                slug: row.get(3)?,
+                title: row.get(4)?,
+                difficulty: row.get(5)?,
+                content: row.get(6)?,
+            })
+        },
+    );
+
+    match result {
+        Err(QueryReturnedNoRows) => Ok(None),
+        Ok(record) => Ok(Some(record)),
+        Err(err) => Err(anyhow!(err)),
+    }
 }
