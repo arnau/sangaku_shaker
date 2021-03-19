@@ -1,126 +1,94 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use clap::{AppSettings, Clap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 mod cache;
+mod sink;
 mod source;
-use cache::{select_children, select_sections, select_siblings, Record};
+use cache::{select_sections, Strategy};
+use sink::write_tree;
 use source::read_entries;
 
-fn build_metadata(data: &mut String, record: &Record) -> Result<()> {
-    let blob = serde_yaml::to_string(record)?;
-    data.push_str(&blob);
-    data.push_str("---\n");
-
-    Ok(())
-}
-
-/// Builds either a node or a leaf.
-fn build_content(conn: &Connection, record: &Record) -> Result<(String, Vec<Record>)> {
-    let children = select_children(conn, &record.ordinal)?;
-
-    let data = if children.is_empty() {
-        let siblings = select_siblings(&conn, &record.ordinal)?;
-
-        build_leaf(&record, siblings)?
-    } else {
-        build_node(record, &children)?
-    };
-
-    Ok((data, children))
-}
-
-/// Builds a tree node.
-fn build_node(record: &Record, children: &[Record]) -> Result<String> {
-    let mut data = String::new();
-    build_metadata(&mut data, &record)?;
-
-    data.push_str(&format!("# {}\n\n", &record.title));
-    data.push_str(&record.content);
-    data.push_str("\n\n");
-    data.push_str("## Table of contents\n\n");
-
-    for child in children {
-        let item = format!("- [{}](./{}.md)\n", &child.title, &child.slug);
-        data.push_str(&item);
-    }
-
-    Ok(data)
-}
-
-/// Builds a leaf of content.
-fn build_leaf(record: &Record, siblings: (Option<Record>, Option<Record>)) -> Result<String> {
-    let (prev, next) = siblings;
-    let mut nav = Vec::new();
-    let mut data = String::new();
-    build_metadata(&mut data, &record)?;
-
-    if let Some(prev) = prev {
-        nav.push(format!("- Previous: [{}]({}.md)", &prev.title, &prev.slug));
-    }
-
-    if let Some(next) = next {
-        nav.push(format!("- Next: [{}]({}.md)", &next.title, &next.slug));
-    }
-
-    data.push_str(&format!("# {}\n\n", &record.title));
-    data.push_str(&record.content);
-    data.push_str("\n\n");
-    data.push_str("## Navigation\n\n");
-    data.push_str(&(nav.join("\n")));
-
-    Ok(data)
-}
-
-/// Takes a record, walks through the dependent tree and writes to a file.
-fn write_tree(conn: &Connection, record: &Record, path: &PathBuf) -> Result<()> {
-    let (data, children) = build_content(conn, &record)?;
-
-    fs::write(&path.join("index.md"), &data)?;
-
-    for child in children {
-        write_node(conn, &child, &path)?;
-    }
-
-    Ok(())
-}
-
-/// Takes a record, walks through the dependent tree and writes to a file.
-fn write_node(conn: &Connection, record: &Record, path: &PathBuf) -> Result<()> {
-    let (data, children) = build_content(conn, &record)?;
-    let filename = format!("{}.md", record.slug);
-
-    fs::write(&path.join(&filename), &data)?;
-
-    for child in children {
-        write_node(conn, &child, &path)?;
-    }
-
-    Ok(())
-}
-
-fn main() -> Result<()> {
-    let source = "../sangaku_manasource/src";
-    let target = Path::new("content");
+fn run<I, O>(input: I, output: O, lang: &str, strategy: Strategy) -> Result<()>
+where
+    I: AsRef<Path>,
+    O: AsRef<Path>,
+{
     let excluded_names = vec!["assets", "temario.md"];
-    let lang = "en";
 
-    let pond = cache::connect()?;
+    // let source = "../sangaku_manasource/src";
+    // let target = Path::new("content");
+    // let lang = "en";
+    // let strategy = Strategy::Memory;
+    // let storage = Strategy::Disk(Path::new("test.db").to_path_buf());
 
-    fs::create_dir(target)?;
-    read_entries(pond.clone(), source, &excluded_names, lang)?;
+    let pond = cache::connect(&strategy)?;
+
+    // Sourcing phase
+    read_entries(pond.clone(), input, &excluded_names, lang)?;
 
     let conn = pond.get()?;
     let sections = select_sections(&conn)?;
 
+    // Sinking phase
+    fs::create_dir(&output)?;
     for entry in sections {
-        let section = target.join(&entry.slug);
+        let section = output.as_ref().join(&entry.slug);
 
         fs::create_dir(&section)?;
 
         write_tree(&conn, &entry, &section)?;
     }
 
+    // sections
+    //     .into_iter()
+    //     .map(|entry| {
+    //         let pond = pond.clone();
+    //         let section = target.join(&entry.slug);
+    //         fs::create_dir(&section).unwrap();
+
+    //         thread::spawn(move || {
+    //             let conn = pond.get().unwrap();
+    //             write_tree(&conn, &entry, &section).unwrap();
+    //         })
+    //     })
+    //     .collect::<Vec<_>>()
+    //     .into_iter()
+    //     .map(thread::JoinHandle::join)
+    //     .collect::<std::result::Result<(), _>>()
+    //     .unwrap();
+
     Ok(())
+}
+
+#[derive(Debug, Clap)]
+#[clap(name = "shaker", version, global_setting(AppSettings::ColoredHelp))]
+struct Cli {
+    /// Cache strategy
+    ///
+    /// If a file path is provided it attempts to create a SQLite database or reuse it if it
+    /// already exists.
+    #[clap(long, short = 'c', value_name = "path", default_value = ":memory:")]
+    cache_path: Strategy,
+    /// Input directory. Expects a valid mana source
+    #[clap(long, short = 'i', value_name = "path")]
+    input_path: PathBuf,
+    /// Output directory
+    #[clap(long, short = 'o', value_name = "path")]
+    output_path: PathBuf,
+    /// Output language
+    #[clap(long, value_name = "code", default_value = "en", possible_values = &["en", "ca", "es"])]
+    lang: String,
+}
+
+fn main() {
+    let cli: Cli = Cli::parse();
+    match run(cli.input_path, cli.output_path, &cli.lang, cli.cache_path) {
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("{:?}", err);
+        }
+    };
 }

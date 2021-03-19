@@ -4,9 +4,42 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, ToSql};
 use rusqlite::{Connection, Error::QueryReturnedNoRows, NO_PARAMS};
 use serde::{Deserialize, Serialize};
-use std::include_str;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 pub type Pond = Pool<SqliteConnectionManager>;
+
+static SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS entry (
+  ordinal text NOT NULL PRIMARY KEY,
+  parent  text,
+  ancestor  NUMBER NOT NULL,
+  slug    text NOT NULL,
+  title   text NOT NULL,
+  difficulty NUMBER,
+  content text NOT NULL
+);
+";
+
+#[derive(Debug)]
+pub enum Strategy {
+    Memory,
+    Disk(PathBuf),
+}
+
+impl FromStr for Strategy {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            ":memory:" => Ok(Strategy::Memory),
+            s => {
+                let path = Path::new(s);
+                Ok(Strategy::Disk(path.into()))
+            }
+        }
+    }
+}
 
 /// Represents record for a cached entry.
 #[derive(Debug, Serialize, Deserialize)]
@@ -25,12 +58,13 @@ pub struct Record {
 }
 
 /// Creates a pool for an in-memory database.
-pub fn connect() -> Result<Pond> {
-    // let manager = SqliteConnectionManager::file("test.db");
-    let manager = SqliteConnectionManager::memory();
+pub fn connect(strategy: &Strategy) -> Result<Pond> {
+    let manager = match strategy {
+        Strategy::Disk(path) => SqliteConnectionManager::file(path),
+        Strategy::Memory => SqliteConnectionManager::memory(),
+    };
     let pool = r2d2::Pool::new(manager)?;
-    let bootstrap = include_str!("./schema.sql");
-    pool.get()?.execute(&bootstrap, params![])?;
+    pool.get()?.execute(SCHEMA, params![])?;
 
     Ok(pool)
 }
